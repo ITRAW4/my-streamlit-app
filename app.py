@@ -5,6 +5,13 @@ import yfinance as yf
 import pandas as pd
 import ta
 
+# محاولة استيراد مكتبة finvizfinance إذا كانت متوفرة
+try:
+    from finvizfinance.screener.overview import Overview
+    FINVIZ_AVAILABLE = True
+except ImportError:
+    FINVIZ_AVAILABLE = False
+
 st.set_page_config(page_title="ماسح الأسهم", layout="centered")
 
 st.markdown("""
@@ -24,7 +31,7 @@ CAP_RANGES = {
     "متوسطة (2 - 10 مليار)": (2e9, 1e10),
     "كبيرة (أكثر من 10 مليار)": (1e10, 1e15),
 }
-MAX_DETAIL = 150  # أقصى عدد أسهم نفحصها بالتفصيل
+MAX_DETAIL = 150  
 
 DEFAULTS = {
     "market": "الكل", "market_value": "أي قيمة", "price": "أي سعر",
@@ -40,7 +47,7 @@ DEFAULTS = {
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
-st.title("إعدادات الفحص")
+st.title("إعدادات الفحص (Yahoo + Finviz)")
 
 with st.expander("01 البيانات الأساسية", expanded=True):
     st.selectbox("السوق", ["الكل", "ناسداك", "NYSE"], key="market")
@@ -72,33 +79,51 @@ with st.expander("04 أسهم الشورت و الدعم", expanded=True):
     st.number_input("الحد الأقصى للأسهم المتاحة", step=1000, key="max_short_float")
     st.number_input("اختبارات الدعم (جلسات)", step=1, key="support_tests")
     st.number_input("جلسات البحث", step=1, key="search_sessions")
-    st.number_input("أقصى ارتفاع عن الدعم (%)", step=1.0, format="%.2f", key="max_rise_support",
-                    help="الدعم: خمس جلسات منفصلة على الأقل يصل فيها أدنى سعر إلى نطاق 2% من الدعم.")
+    st.number_input("أقصى ارتفاع عن الدعم (%)", step=1.0, format="%.2f", key="max_rise_support")
 
 st.checkbox("فحص تجريبي سريع (أول 300 سهم فقط)", key="quick")
 
 
-# ---------------- جلب البيانات ----------------
+# ---------------- جلب البيانات (مدمج Yahoo و Finviz) ----------------
 @st.cache_data(ttl=86400)
 def load_universe(market):
+    symbols = []
+    
+    # 1. محاولة جلب الأسهم من Finviz إذا كانت متاحة لتوسيع القائمة
+    if FINVIZ_AVAILABLE:
+        try:
+            overview = Overview()
+            df_finviz = overview.screener_view()
+            if not df_finviz.empty and "Ticker" in df_finviz.columns:
+                symbols.extend(df_finviz["Ticker"].tolist())
+        except Exception:
+            pass
+
+    # 2. الجلب الأساسي من ناسداك و ياهو كالعادة لضمان الاكتمال
     base = "https://www.nasdaqtrader.com/dynamic/SymDir/"
     parts = []
-    if market in ("الكل", "ناسداك"):
-        d = pd.read_csv(base + "nasdaqlisted.txt", sep="|")
-        d = d[(d["Test Issue"] == "N") & (d["ETF"] == "N")]
-        parts.append(d["Symbol"])
-    if market in ("الكل", "NYSE"):
-        d = pd.read_csv(base + "otherlisted.txt", sep="|")
-        d = d[(d["Test Issue"] == "N") & (d["ETF"] == "N")]
-        parts.append(d["ACT Symbol"])
-    s = pd.concat(parts).dropna().astype(str)
-    s = s[s.str.fullmatch(r"[A-Z]{1,5}")]
-    return sorted(s.unique().tolist())
+    try:
+        if market in ("الكل", "ناسداك"):
+            d = pd.read_csv(base + "nasdaqlisted.txt", sep="|")
+            d = d[(d["Test Issue"] == "N") & (d["ETF"] == "N")]
+            parts.append(d["Symbol"])
+        if market in ("الكل", "NYSE"):
+            d = pd.read_csv(base + "otherlisted.txt", sep="|")
+            d = d[(d["Test Issue"] == "N") & (d["ETF"] == "N")]
+            parts.append(d["ACT Symbol"])
+        if parts:
+            s = pd.concat(parts).dropna().astype(str)
+            s = s[s.str.fullmatch(r"[A-Z]{1,5}")]
+            symbols.extend(s.unique().tolist())
+    except Exception:
+        pass
+
+    symbols = list(set(symbols)) # إزالة التكرار
+    return sorted(symbols)
 
 
 @st.cache_data(ttl=3600)
 def load_shortable():
-    """الأسهم المتاحة للاقتراض من ملف Interactive Brokers العام."""
     try:
         ftp = ftplib.FTP("ftp3.interactivebrokers.com", timeout=30)
         ftp.login("shortstock", "")
@@ -131,7 +156,7 @@ def scan_indicators(symbols, s):
         bar.progress(done / len(symbols), text=f"تحميل الأسعار {done} / {len(symbols)}")
         try:
             data = yf.download(chunk, period=period, interval="1d", group_by="ticker",
-                               auto_adjust=True, progress=False, threads=True)
+                             auto_adjust=True, progress=False, threads=True)
         except Exception:
             continue
         for sym in chunk:
@@ -256,7 +281,6 @@ def run_scan():
     return results
 
 
-# ---------------- الأزرار ----------------
 def reset_all():
     for k, v in DEFAULTS.items():
         st.session_state[k] = v
