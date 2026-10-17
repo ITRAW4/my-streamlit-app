@@ -156,4 +156,145 @@ def scan_indicators(symbols, s):
         bar.progress(done / len(symbols), text=f"تحميل الأسعار {done} / {len(symbols)}")
         try:
             data = yf.download(chunk, period=period, interval="1d", group_by="ticker",
-                               auto_adjust=True,
+                               auto_adjust=True, progress=False, threads=True)
+        except Exception:
+            continue
+        for sym in chunk:
+            try:
+                close = data[sym]["Close"].dropna()
+                price = float(close.iloc[-1])
+                if not (pmin <= price <= pmax):
+                    continue
+                if s.timeframe == "أسبوعي":
+                    close = close.resample("W").last().dropna()
+                elif s.timeframe == "شهري":
+                    close = close.resample("ME").last().dropna()
+                if len(close) < 40:
+                    continue
+                sma = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
+                if s.price_loc == "فوق المتوسط 50" and (sma is None or price <= sma):
+                    continue
+                if s.price_loc == "تحت المتوسط 50" and (sma is None or price >= sma):
+                    continue
+                rsi = float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1])
+                macd = float(ta.trend.MACD(close).macd().iloc[-1])
+                if s.use_rsi and not (s.rsi_from <= rsi <= s.rsi_to):
+                    continue
+                if s.use_macd and not (s.macd_from <= macd <= s.macd_to):
+                    continue
+                rows.append({"sym": sym, "price": price, "rsi": rsi, "macd": macd})
+            except Exception:
+                continue
+    bar.empty()
+    return rows
+
+
+def detail_checks(row, s, shortable):
+    sym = row["sym"]
+    t = yf.Ticker(sym)
+    info = t.info
+    cap, flt = info.get("marketCap"), info.get("floatShares")
+
+    if s.market_value != "أي قيمة":
+        lo, hi = CAP_RANGES[s.market_value]
+        if cap is None or not (lo <= cap <= hi):
+            return None
+    if s.use_float:
+        if flt is None or not (s.float_min * 1000 <= flt <= s.float_max * 1000):
+            return None
+
+    hist = t.history(period="1y", interval="1d")
+    if hist.empty:
+        return None
+
+    if s.use_reverse:
+        sp = t.splits
+        if len(sp) == 0:
+            return None
+        cutoff = pd.Timestamp.now(tz=sp.index.tz) - pd.Timedelta(days=int(s.split_days))
+        rev = sp[(sp < 1) & (sp.index >= cutoff)]
+        if rev.empty:
+            return None
+        if s.use_max_rise_split:
+            after = hist[hist.index >= rev.index[-1]]
+            if after.empty:
+                return None
+            rise = (after["High"].max() / after["Close"].iloc[0] - 1) * 100
+            if rise > s.max_rise_split:
+                return None
+
+    avail = shortable.get(sym) if shortable else None
+    if s.use_short and shortable is not None:
+        if avail is None or not (0 < avail <= s.max_short_float):
+            return None
+
+    rise_sup = None
+    if s.use_support:
+        w = hist.tail(int(s.search_sessions))
+        if len(w) < int(s.search_sessions):
+            return None
+        sup = w["Low"].min()
+        tests = int((w["Low"] <= sup * 1.02).sum())
+        if tests < s.support_tests:
+            return None
+        rise_sup = (hist["Close"].iloc[-1] / sup - 1) * 100
+        if rise_sup > s.max_rise_support:
+            return None
+
+    return {
+        "الرمز": sym,
+        "السعر": round(row["price"], 2),
+        "RSI": round(row["rsi"], 2),
+        "MACD": round(row["macd"], 3),
+        "الأسهم الحرة (مليون)": round(flt / 1e6, 2) if flt else None,
+        "المتاح للاقتراض": avail,
+        "ارتفاع عن الدعم %": round(rise_sup, 1) if rise_sup is not None else None,
+    }
+
+
+def run_scan():
+    s = st.session_state
+    symbols = load_universe(s.market)
+    if s.quick:
+        # عشوائي بدل أول 300 (اللي كانت كلها تبدأ بحرف A)
+        symbols = random.sample(symbols, min(300, len(symbols)))
+
+    shortable = load_shortable() if s.use_short else None
+    if s.use_short and shortable is None:
+        st.warning("تعذر جلب بيانات الاقتراض، تم تخطي هذا الفلتر.")
+
+    rows = scan_indicators(symbols, s)
+    st.write(f"مرّ {len(rows)} سهم من فلتر السعر والمؤشرات. جاري الفحص التفصيلي...")
+    if len(rows) > MAX_DETAIL:
+        st.warning(f"النتائج كثيرة، سيتم فحص {MAX_DETAIL} سهم عشوائياً. ضيّق الشروط للحصول على نتيجة أدق.")
+        rows = random.sample(rows, MAX_DETAIL)
+
+    results, bar = [], st.progress(0.0)
+    for i, r in enumerate(rows):
+        bar.progress((i + 1) / max(len(rows), 1), text=f"فحص {r['sym']}")
+        try:
+            out = detail_checks(r, s, shortable)
+        except Exception:
+            continue
+        if out:
+            results.append(out)
+    bar.empty()
+    return results
+
+
+def reset_all():
+    for k, v in DEFAULTS.items():
+        st.session_state[k] = v
+
+
+start = st.button("▶ بدء الفحص", type="primary", use_container_width=True)
+st.button("■ إيقاف الفحص", use_container_width=True)
+st.button("↺ إعادة تعيين", on_click=reset_all, use_container_width=True)
+
+if start:
+    found = run_scan()
+    if found:
+        st.success(f"تم العثور على {len(found)} سهم مطابق")
+        st.dataframe(pd.DataFrame(found), use_container_width=True, hide_index=True)
+    else:
+        st.warning("ما فيه أسهم مطابقة للشروط الحالية.")
